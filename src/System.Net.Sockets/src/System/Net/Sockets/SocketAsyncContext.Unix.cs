@@ -119,6 +119,7 @@ namespace System.Net.Sockets
             }
 
             private int _state; // Actually AsyncOperation.State.
+            private int _completionManagedThreadId = -1; // Contains the managed thread id of the thread where the operation is running, otherwise -1
 
 #if DEBUG
             private int _callbackQueued; // When non-zero, the callback has been queued.
@@ -157,7 +158,9 @@ namespace System.Net.Sockets
             {
                 TraceWithContext(context, "Enter");
 
+                _completionManagedThreadId = Environment.CurrentManagedThreadId;
                 bool result = DoTryComplete(context);
+                _completionManagedThreadId = -1;
 
                 TraceWithContext(context, $"Exit, result={result}");
 
@@ -178,18 +181,32 @@ namespace System.Net.Sockets
                 return true;
             }
 
-            public void SetComplete()
+            public bool TrySetComplete()
             {
-                Debug.Assert(Volatile.Read(ref _state) == (int)State.Running);
+                State oldState = (State)Interlocked.CompareExchange(ref _state, (int)State.Complete, (int)State.Running);
+                if (oldState == State.Cancelled)
+                {
+                    // This operation has already been cancelled, and had its completion processed.
+                    // Simply return false to indicate no further processing is needed.
+                    return false;
+                }
 
-                Volatile.Write(ref _state, (int)State.Complete);
+                Debug.Assert(oldState == State.Running);
+                return true;
             }
 
-            public void SetWaiting()
+            public bool TrySetWaiting()
             {
-                Debug.Assert(Volatile.Read(ref _state) == (int)State.Running);
+                State oldState = (State)Interlocked.CompareExchange(ref _state, (int)State.Waiting, (int)State.Running);
+                if (oldState == State.Cancelled)
+                {
+                    // This operation has already been cancelled, and had its completion processed.
+                    // Simply return false to indicate no further processing is needed.
+                    return false;
+                }
 
-                Volatile.Write(ref _state, (int)State.Waiting);
+                Debug.Assert(oldState == State.Running);
+                return true;
             }
 
             public bool TryCancel()
@@ -201,9 +218,20 @@ namespace System.Net.Sockets
                 // important we clean it up, regardless.
                 CancellationRegistration.Dispose();
 
+                // If we attempt to cancel the operation on the same thread where it's running, it will result in a deadlock
+                // Thus we try to transition directly from Running to Cancelled.
+                bool selfCancellation = false;
+                if (_completionManagedThreadId == Environment.CurrentManagedThreadId)
+                {
+                    Trace("TryCancel() called from TryComplete() thread");
+                    State oldState = (State) Interlocked.CompareExchange(ref _state, (int)State.Cancelled, (int)State.Running);
+                    Debug.Assert(oldState == State.Running);
+                    selfCancellation = true;
+                }
+
                 // Try to transition from Waiting to Cancelled
                 var spinWait = new SpinWait();
-                bool keepWaiting = true;
+                bool keepWaiting = !selfCancellation;
                 while (keepWaiting)
                 {
                     int state = Interlocked.CompareExchange(ref _state, (int)State.Cancelled, (int)State.Waiting);
@@ -935,12 +963,17 @@ namespace System.Net.Sockets
                     // Try to perform the IO
                     if (op.TryComplete(context))
                     {
-                        op.SetComplete();
-                        wasCompleted = true;
+                        if (op.TrySetComplete())
+                        {
+                            wasCompleted = true;
+                        }
                         break;
                     }
 
-                    op.SetWaiting();
+                    if (!op.TrySetWaiting())
+                    {
+                        break;
+                    }
 
                     // Check for retry and reset queue state.
 
